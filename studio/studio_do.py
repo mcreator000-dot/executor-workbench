@@ -7,36 +7,60 @@ Usage:
   python -u studio_do.py console [substr ...]
   python -u studio_do.py script <path> [Edit|Client|Server]
 
-The MCP bridge returns an empty studio list for several seconds after a restart or a
-play/stop transition, so every call retries instead of concluding Studio is gone.
+An empty discovery response may mean Studio is transitioning. Exit 3 means
+Studio or the command outcome could not be confirmed. Exit 1 means a command
+reported an error; exit 2 means invalid usage.
 """
-import sys, json, time
+import json
+import sys
+import time
 
-sys.path.insert(0, r'D:\RobloxRE\studio')
 from mc import Studio
+
+UNCONFIRMED = 3
+
+
+def list_studios(s):
+    status, text = s.call("list_roblox_studios", {})
+    if status != "OK":
+        raise RuntimeError(text)
+    studios = json.loads(text)["studios"]
+    if not isinstance(studios, list) or any(
+        not isinstance(entry, dict) or not entry.get("id") for entry in studios
+    ):
+        raise ValueError("unexpected Studio discovery response")
+    return studios
 
 
 def with_studio(fn, tries=12, delay=4.0):
-    last = None
+    last = "discovery has not started"
     for i in range(tries):
-        s = Studio()
+        s = None
         try:
-            s.wait_connected()
-            st, tx = s.call("list_roblox_studios", {})
-            try:
-                studios = json.loads(tx).get("studios", [])
-            except Exception:
-                studios = []
-            if studios:
-                return fn(s, studios[0])
-            last = tx
+            s = Studio()
+            if not s.wait_connected():
+                raise RuntimeError("MCP tools unavailable")
+            studios = list_studios(s)
         except Exception as e:
-            last = repr(e)
-        finally:
+            last = str(e)
+        else:
+            if studios:
+                # Do not retry a command that may already have taken effect.
+                return run_and_close(s, fn, studios[0])
+            last = "Studio list is temporarily empty"
+        if s is not None:
             s.close()
-        time.sleep(delay)
-    print("no studio after retries:", str(last)[:200], flush=True)
-    return 1
+        if i + 1 < tries:
+            time.sleep(delay)
+    print("Studio discovery unconfirmed:", last[:200], flush=True)
+    return UNCONFIRMED
+
+
+def run_and_close(s, fn, studio):
+    try:
+        return fn(s, studio)
+    finally:
+        s.close()
 
 
 def cmd_state(s, d):
@@ -46,10 +70,40 @@ def cmd_state(s, d):
     return 0
 
 
-def cmd_stop(s, d):
-    st, tx = s.call("start_stop_play", {"is_start": False, "studio_id": d["id"]})
-    print("stop:", st, tx[:200], flush=True)
-    return 0 if st == "OK" else 1
+def in_edit(studio):
+    return str(studio.get("mode", "")).casefold() == "edit"
+
+
+def cmd_stop(s, d, tries=12, delay=4.0):
+    studio_id = d["id"]
+    if in_edit(d):
+        print("stop: confirmed Edit mode (already stopped)", flush=True)
+        return 0
+
+    try:
+        status, text = s.call("start_stop_play", {"is_start": False, "studio_id": studio_id})
+    except Exception as e:
+        status, text = "ERROR", str(e)
+
+    if status == "ERR" and "timeout" not in text.casefold() and "timed out" not in text.casefold():
+        print("stop: rejected:", text[:200], flush=True)
+        return 1
+
+    last = "no discovery response yet"
+    for i in range(tries):
+        try:
+            target = next((entry for entry in list_studios(s) if entry["id"] == studio_id), None)
+            if target is not None and in_edit(target):
+                print(f"stop: confirmed Edit mode for {studio_id}", flush=True)
+                return 0
+            last = "target not listed" if target is None else f"mode={target.get('mode')!r}"
+        except Exception as e:
+            last = str(e)
+        if i + 1 < tries:
+            time.sleep(delay)
+
+    print(f"stop: outcome unconfirmed for {studio_id} ({status}: {text[:120]}; {last[:120]})", flush=True)
+    return UNCONFIRMED
 
 
 def cmd_start(s, d, wait=20):
@@ -67,7 +121,7 @@ def cmd_console(s, d, needles):
     print("console:", st, "lines:", len(lines), flush=True)
     for l in lines[-40:]:
         print("  ", l.rstrip(), flush=True)
-    return 0
+    return 0 if st == "OK" else 1
 
 
 def cmd_script(s, d, path, dm="Edit"):

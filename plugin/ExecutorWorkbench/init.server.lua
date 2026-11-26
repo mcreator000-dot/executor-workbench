@@ -92,8 +92,7 @@ local function append(channel, text)
 end
 
 -- ---------------------------------------------------------------- shared environment
--- Persists for the life of the plugin and is the _ENV of every server-mode snippet, so a global
--- written by one run is readable by the next. Documented reset: plugin reload / Studio restart.
+-- Persists across server runs for the life of the plugin. Reloading the plugin resets it.
 local genv = {}
 genv.version = "workbench-2"
 
@@ -168,70 +167,54 @@ local function getFolder()
 	return f
 end
 
-local PREFIX = "return function(log)\n\tlocal print = log.print\n\tlocal warn = log.warn\n\treturn function()\n"
-local SUFFIX = "\n\tend\nend\n"
+local PREFIX = "return function()\n"
+local SUFFIX = "\nend\n"
+
+local function runLogger(channel, id)
+	return function(...)
+		local parts = {}
+		for i = 1, select("#", ...) do
+			parts[i] = tostring((select(i, ...)))
+		end
+		append(channel, "#" .. id .. " " .. table.concat(parts, " "))
+	end
+end
 
 local function runServer(source)
 	local id = counter
 	local started = os.clock()
-
 	local module = Instance.new("ModuleScript")
-	module.Name = "WB_Run_" .. id
-	module.Source = PREFIX .. source .. SUFFIX
-	module.Parent = getFolder()
-
-	local okFactory, factory = pcall(require, module)
-	if not okFactory then
-		module:Destroy()
-		append("error", "compile/require failed: " .. tostring(factory))
-		return false
-	end
-
-	local log = {}
-	log.print = function(...)
-		local parts = {}
-		for i = 1, select("#", ...) do
-			parts[i] = tostring((select(i, ...)))
-		end
-		append("print", table.concat(parts, " "))
-	end
-	log.warn = function(...)
-		local parts = {}
-		for i = 1, select("#", ...) do
-			parts[i] = tostring((select(i, ...)))
-		end
-		append("warn", table.concat(parts, " "))
-	end
-
-	local okMake, runner = pcall(factory, log)
-	if not okMake then
-		module:Destroy()
-		append("error", "factory failed: " .. tostring(runner))
-		return false
-	end
-
-	-- Globals read and written by the snippet land in genv, so they survive to the next run.
-	genv.print = log.print
-	genv.warn = log.warn
-	local okEnv = pcall(function()
-		setfenv(runner, genv)
-	end)
-	if not okEnv then
-		append("warn", "setfenv unavailable; globals are per-run")
-	end
-
-	local okRun, errRun = xpcall(runner, function(e)
+	local okRun, errRun = xpcall(function()
+		module.Name = "WB_Run_" .. id
+		module.Source = PREFIX .. source .. SUFFIX
+		module.Parent = getFolder()
+		local runner = require(module)
+		local defaults = getfenv(runner)
+		local env = setmetatable({
+			print = runLogger("print", id),
+			warn = runLogger("warn", id),
+		}, {
+			__index = function(_, key)
+				local value = rawget(genv, key)
+				if value ~= nil then
+					return value
+				end
+				return defaults[key]
+			end,
+			__newindex = genv,
+		})
+		setfenv(runner, env)
+		runner()
+	end, function(e)
 		return debug.traceback(tostring(e), 2)
 	end)
-
 	module:Destroy()
 
 	if okRun then
 		append("ok", string.format("run #%d done in %.1f ms (server)", id, (os.clock() - started) * 1000))
-		append("info", "WalkSpeed check needs client context; use a client snippet for LocalPlayer")
 		return true
 	end
-	append("error", tostring(errRun))
+	append("error", "server run #" .. id .. ": " .. tostring(errRun))
 	return false
 end
 
@@ -255,8 +238,18 @@ local function clearClientScripts()
 end
 
 local CLIENT_PREFIX = "local ok, err = xpcall(function()\n"
-local CLIENT_SUFFIX = "\nend, function(e) return debug.traceback(tostring(e), 2) end)\n" ..
-	"if ok then\n\tprint(\"WB_CLIENT_OK\")\nelse\n\twarn(\"WB_CLIENT_ERR \" .. tostring(err))\nend\n"
+local function clientSuffix(id)
+	return "\nend, function(e) return debug.traceback(tostring(e), 2) end)\n" ..
+		string.format([=[
+if ok then
+	print("WB_CLIENT_OK")
+	print("WB_CLIENT_RESULT %d OK")
+else
+	warn("WB_CLIENT_ERR " .. tostring(err))
+	warn("WB_CLIENT_RESULT %d ERR " .. tostring(err))
+end
+]=], id, id)
+end
 
 local function runClient(source)
 	local folder = StarterPlayer:FindFirstChild("StarterPlayerScripts")
@@ -268,7 +261,7 @@ local function runClient(source)
 
 	local script = Instance.new("LocalScript")
 	script.Name = "WB_Client_" .. counter
-	script.Source = CLIENT_PREFIX .. source .. CLIENT_SUFFIX
+	script.Source = CLIENT_PREFIX .. source .. clientSuffix(counter)
 	script.Parent = folder
 
 	append("info", string.format("installed %s (cleared %d previous)", script.Name, removed))
@@ -277,15 +270,112 @@ local function runClient(source)
 end
 
 -- ---------------------------------------------------------------- routing
-local CLIENT_HINTS = { "LocalPlayer", "CharacterAdded", "LocalScript", "CurrentCamera", "UserInputService" }
+local CLIENT_HINTS = {
+	LocalPlayer = true,
+	CharacterAdded = true,
+	LocalScript = true,
+	CurrentCamera = true,
+	UserInputService = true,
+}
 
 local function needsClient(source)
-	for _, hint in ipairs(CLIENT_HINTS) do
-		if string.find(source, hint, 1, true) then
-			return hint
+	local i = 1
+	local function skipLong()
+		local equals = string.match(source, "^%[(=*)%[", i)
+		if not equals then
+			return false
+		end
+		local _, last = string.find(source, "]" .. equals .. "]", i + #equals + 2, true)
+		i = last and last + 1 or #source + 1
+		return true
+	end
+
+	local scan
+	local function scanTemplate()
+		i += 1
+		while i <= #source do
+			local c = string.sub(source, i, i)
+			i += 1
+			if c == "`" then
+				return nil
+			elseif c == "\\" then
+				i += 1
+			elseif c == "{" then
+				local hint = scan(true)
+				if hint then
+					return hint
+				end
+			end
 		end
 	end
-	return nil
+
+	scan = function(interpolation)
+		local depth = 0
+		local previous, beforePrevious, thirdPrevious
+		local function token(value)
+			thirdPrevious, beforePrevious, previous = beforePrevious, previous, value
+		end
+		while i <= #source do
+			local c = string.sub(source, i, i)
+			if string.sub(source, i, i + 1) == "--" then
+				i += 2
+				if not skipLong() then
+					i = string.find(source, "[\r\n]", i) or #source + 1
+				end
+			elseif c == "'" or c == '"' then
+				local first = i + 1
+				i = first
+				while i <= #source and string.sub(source, i, i) ~= c do
+					i += string.sub(source, i, i) == "\\" and 2 or 1
+				end
+				local literal = string.sub(source, first, i - 1)
+				if i <= #source and previous == "(" then
+					if beforePrevious == "GetService" and thirdPrevious == ":" and literal == "UserInputService" then
+						return literal
+					elseif beforePrevious == "Instance.new" and literal == "LocalScript" then
+						return literal
+					end
+				end
+				i += 1
+				token("<string>")
+			elseif c == "`" then
+				local hint = scanTemplate()
+				if hint then
+					return hint
+				end
+				token("<string>")
+			elseif c == "[" and skipLong() then
+				token("<string>")
+			elseif string.match(c, "[%a_]") then
+				local name = string.match(source, "^[%a_][%w_]*", i)
+				if CLIENT_HINTS[name] then
+					return name
+				end
+				i += #name
+				token(name == "new" and previous == "." and beforePrevious == "Instance" and "Instance.new" or name)
+			elseif string.match(c, "%d") then
+				i += #string.match(source, "^%d[%w_]*", i)
+				token("<number>")
+			else
+				i += 1
+				if interpolation then
+					if c == "}" and depth == 0 then
+						return nil
+					elseif c == "}" then
+						depth -= 1
+					elseif c == "{" then
+						depth += 1
+					end
+				end
+				if not string.match(c, "%s") then
+					token(c)
+				end
+			end
+		end
+		return nil
+	end
+
+	return scan(false)
 end
 
 local function run(source)
