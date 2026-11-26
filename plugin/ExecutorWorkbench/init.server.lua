@@ -4,8 +4,10 @@
 --   * Server/Edit: a fresh ModuleScript in ServerStorage, required and called. No LocalPlayer here.
 --   * Client: a LocalScript placed in StarterPlayer.StarterPlayerScripts. LocalPlayer and the
 --     character only exist HERE, during a playtest (F5/Play).
--- Client-only snippets are detected and routed automatically; the pane says which path ran.
+-- Client-only snippets are staged in Edit mode; their verdict is read from Client Output.
 
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
 local StudioService = game:GetService("StudioService")
@@ -82,7 +84,7 @@ local function stamp()
 	return os.date("%H:%M:%S")
 end
 
--- channel: print | warn | error | info | run | ok
+-- channel: print | warn | error | info | run | ok | pending
 local function append(channel, text)
 	table.insert(history, "[" .. stamp() .. "][" .. channel .. "] " .. tostring(text))
 	if #history > 600 then
@@ -237,35 +239,48 @@ local function clearClientScripts()
 	return removed
 end
 
-local CLIENT_PREFIX = "local ok, err = xpcall(function()\n"
-local function clientSuffix(id)
+local CLIENT_PREFIX = [=[
+if not game:GetService("RunService"):IsStudio() then
+	return
+end
+
+local ok, err = xpcall(function()
+]=]
+
+local function clientSuffix(marker)
 	return "\nend, function(e) return debug.traceback(tostring(e), 2) end)\n" ..
 		string.format([=[
+local marker = %q
 if ok then
-	print("WB_CLIENT_OK")
-	print("WB_CLIENT_RESULT %d OK")
+	print(marker .. " OK")
 else
-	warn("WB_CLIENT_ERR " .. tostring(err))
-	warn("WB_CLIENT_RESULT %d ERR " .. tostring(err))
+	warn(marker .. " ERR " .. tostring(err))
 end
-]=], id, id)
+]=], marker)
 end
 
 local function runClient(source)
+	if not RunService:IsEdit() then
+		append("error", "stop the playtest and stage the client run in Edit mode")
+		return false
+	end
+
 	local folder = StarterPlayer:FindFirstChild("StarterPlayerScripts")
 	if not folder then
 		append("error", "no StarterPlayerScripts in this place")
 		return false
 	end
+
+	-- A fresh marker also separates results left in Output after a plugin reload.
+	local marker = "WB_CLIENT_RESULT " .. HttpService:GenerateGUID(false)
 	local removed = clearClientScripts()
+	local clientScript = Instance.new("LocalScript")
+	clientScript.Name = "WB_Client_" .. counter
+	clientScript.Source = CLIENT_PREFIX .. source .. clientSuffix(marker)
+	clientScript.Parent = folder
 
-	local script = Instance.new("LocalScript")
-	script.Name = "WB_Client_" .. counter
-	script.Source = CLIENT_PREFIX .. source .. clientSuffix(counter)
-	script.Parent = folder
-
-	append("info", string.format("installed %s (cleared %d previous)", script.Name, removed))
-	append("info", "press Play (F5); client output appears in Output as WB_CLIENT_OK / WB_CLIENT_ERR")
+	append("pending", "awaiting client result; press F5 (Play), then read Studio Output (Context: Client)")
+	append("info", string.format("staged %s (cleared %d previous); search Output for %s", clientScript.Name, removed, marker))
 	return true
 end
 
@@ -444,4 +459,4 @@ if button then
 end
 
 widget.Enabled = true
-append("info", "workbench ready - server snippets run inline, client snippets (LocalPlayer) install and need Play")
+append("info", "workbench ready - server snippets run inline, client snippets (LocalPlayer) are staged for Play")

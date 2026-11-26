@@ -3,10 +3,11 @@
 //   c++ -std=c++11 -I luau_upstream/Common/include tests/bytecode_contract.cpp -o /tmp/bytecode-contract
 //   /tmp/bytecode-contract
 // Review format compatibility before updating any expected value.
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
-#include "Luau/Bytecode.h"
+#include "Luau/BytecodeUtils.h"
 
 #define EXPECT_VALUE(symbol, expected) \
     static_assert((symbol) == (expected), "Luau bytecode contract drift: " #symbol " expected " #expected)
@@ -19,108 +20,142 @@ EXPECT_VALUE(LBC_TYPE_VERSION_MIN, 1);
 EXPECT_VALUE(LBC_TYPE_VERSION_MAX, 3);
 EXPECT_VALUE(LBC_TYPE_VERSION_TARGET, 3);
 
-// Opcode bytes in wire order; the final entry is the count sentinel.
-EXPECT_VALUE(LOP_NOP, 0);
-EXPECT_VALUE(LOP_BREAK, 1);
-EXPECT_VALUE(LOP_LOADNIL, 2);
-EXPECT_VALUE(LOP_LOADB, 3);
-EXPECT_VALUE(LOP_LOADN, 4);
-EXPECT_VALUE(LOP_LOADK, 5);
-EXPECT_VALUE(LOP_MOVE, 6);
-EXPECT_VALUE(LOP_GETGLOBAL, 7);
-EXPECT_VALUE(LOP_SETGLOBAL, 8);
-EXPECT_VALUE(LOP_GETUPVAL, 9);
-EXPECT_VALUE(LOP_SETUPVAL, 10);
-EXPECT_VALUE(LOP_CLOSEUPVALS, 11);
-EXPECT_VALUE(LOP_GETIMPORT, 12);
-EXPECT_VALUE(LOP_GETTABLE, 13);
-EXPECT_VALUE(LOP_SETTABLE, 14);
-EXPECT_VALUE(LOP_GETTABLEKS, 15);
-EXPECT_VALUE(LOP_SETTABLEKS, 16);
-EXPECT_VALUE(LOP_GETTABLEN, 17);
-EXPECT_VALUE(LOP_SETTABLEN, 18);
-EXPECT_VALUE(LOP_NEWCLOSURE, 19);
-EXPECT_VALUE(LOP_NAMECALL, 20);
-EXPECT_VALUE(LOP_CALL, 21);
-EXPECT_VALUE(LOP_RETURN, 22);
-EXPECT_VALUE(LOP_JUMP, 23);
-EXPECT_VALUE(LOP_JUMPBACK, 24);
-EXPECT_VALUE(LOP_JUMPIF, 25);
-EXPECT_VALUE(LOP_JUMPIFNOT, 26);
-EXPECT_VALUE(LOP_JUMPIFEQ, 27);
-EXPECT_VALUE(LOP_JUMPIFLE, 28);
-EXPECT_VALUE(LOP_JUMPIFLT, 29);
-EXPECT_VALUE(LOP_JUMPIFNOTEQ, 30);
-EXPECT_VALUE(LOP_JUMPIFNOTLE, 31);
-EXPECT_VALUE(LOP_JUMPIFNOTLT, 32);
-EXPECT_VALUE(LOP_ADD, 33);
-EXPECT_VALUE(LOP_SUB, 34);
-EXPECT_VALUE(LOP_MUL, 35);
-EXPECT_VALUE(LOP_DIV, 36);
-EXPECT_VALUE(LOP_MOD, 37);
-EXPECT_VALUE(LOP_POW, 38);
-EXPECT_VALUE(LOP_ADDK, 39);
-EXPECT_VALUE(LOP_SUBK, 40);
-EXPECT_VALUE(LOP_MULK, 41);
-EXPECT_VALUE(LOP_DIVK, 42);
-EXPECT_VALUE(LOP_MODK, 43);
-EXPECT_VALUE(LOP_POWK, 44);
-EXPECT_VALUE(LOP_AND, 45);
-EXPECT_VALUE(LOP_OR, 46);
-EXPECT_VALUE(LOP_ANDK, 47);
-EXPECT_VALUE(LOP_ORK, 48);
-EXPECT_VALUE(LOP_CONCAT, 49);
-EXPECT_VALUE(LOP_NOT, 50);
-EXPECT_VALUE(LOP_MINUS, 51);
-EXPECT_VALUE(LOP_LENGTH, 52);
-EXPECT_VALUE(LOP_NEWTABLE, 53);
-EXPECT_VALUE(LOP_DUPTABLE, 54);
-EXPECT_VALUE(LOP_SETLIST, 55);
-EXPECT_VALUE(LOP_FORNPREP, 56);
-EXPECT_VALUE(LOP_FORNLOOP, 57);
-EXPECT_VALUE(LOP_FORGLOOP, 58);
-EXPECT_VALUE(LOP_FORGPREP_INEXT, 59);
-EXPECT_VALUE(LOP_FASTCALL3, 60);
-EXPECT_VALUE(LOP_FORGPREP_NEXT, 61);
-EXPECT_VALUE(LOP_NATIVECALL, 62);
-EXPECT_VALUE(LOP_GETVARARGS, 63);
-EXPECT_VALUE(LOP_DUPCLOSURE, 64);
-EXPECT_VALUE(LOP_PREPVARARGS, 65);
-EXPECT_VALUE(LOP_LOADKX, 66);
-EXPECT_VALUE(LOP_JUMPX, 67);
-EXPECT_VALUE(LOP_FASTCALL, 68);
-EXPECT_VALUE(LOP_COVERAGE, 69);
-EXPECT_VALUE(LOP_CAPTURE, 70);
-EXPECT_VALUE(LOP_SUBRK, 71);
-EXPECT_VALUE(LOP_DIVRK, 72);
-EXPECT_VALUE(LOP_FASTCALL1, 73);
-EXPECT_VALUE(LOP_FASTCALL2, 74);
-EXPECT_VALUE(LOP_FASTCALL2K, 75);
-EXPECT_VALUE(LOP_FORGPREP, 76);
-EXPECT_VALUE(LOP_JUMPXEQKNIL, 77);
-EXPECT_VALUE(LOP_JUMPXEQKB, 78);
-EXPECT_VALUE(LOP_JUMPXEQKN, 79);
-EXPECT_VALUE(LOP_JUMPXEQKS, 80);
-EXPECT_VALUE(LOP_IDIV, 81);
-EXPECT_VALUE(LOP_IDIVK, 82);
-EXPECT_VALUE(LOP_GETUDATAKS, 83);
-EXPECT_VALUE(LOP_SETUDATAKS, 84);
-EXPECT_VALUE(LOP_NAMECALLUDATA, 85);
-EXPECT_VALUE(LOP_NEWCLASSMEMBER, 86);
-EXPECT_VALUE(LOP_CALLFB, 87);
-EXPECT_VALUE(LOP_CMPPROTO, 88);
-EXPECT_VALUE(LOP_FASTPCALL, 89);
-EXPECT_VALUE(LOP_NEWCLASS, 90);
-EXPECT_VALUE(LOP_CONSTRUCT, 91);
-EXPECT_VALUE(LOP_FINCONSTRUCT, 92);
-EXPECT_VALUE(LOP_GETPRIVATEFIELD, 93);
-EXPECT_VALUE(LOP_SETPRIVATEFIELD, 94);
 EXPECT_VALUE(LOP__COUNT, 95);
+
+struct OpcodeContract
+{
+    LuauOpcode opcode;
+    int words; // Header plus AUX, if any. NEWCLOSURE capture words are separate opcodes.
+};
+
+// One explicit row per opcode, in wire order. Let the compiler infer the array size so
+// a missing row cannot become a zero-filled entry.
+constexpr OpcodeContract opcodeContract[] = {
+    {LOP_NOP, 1},
+    {LOP_BREAK, 1},
+    {LOP_LOADNIL, 1},
+    {LOP_LOADB, 1},
+    {LOP_LOADN, 1},
+    {LOP_LOADK, 1},
+    {LOP_MOVE, 1},
+    {LOP_GETGLOBAL, 2},
+    {LOP_SETGLOBAL, 2},
+    {LOP_GETUPVAL, 1},
+    {LOP_SETUPVAL, 1},
+    {LOP_CLOSEUPVALS, 1},
+    {LOP_GETIMPORT, 2},
+    {LOP_GETTABLE, 1},
+    {LOP_SETTABLE, 1},
+    {LOP_GETTABLEKS, 2},
+    {LOP_SETTABLEKS, 2},
+    {LOP_GETTABLEN, 1},
+    {LOP_SETTABLEN, 1},
+    {LOP_NEWCLOSURE, 1},
+    {LOP_NAMECALL, 2},
+    {LOP_CALL, 1},
+    {LOP_RETURN, 1},
+    {LOP_JUMP, 1},
+    {LOP_JUMPBACK, 1},
+    {LOP_JUMPIF, 1},
+    {LOP_JUMPIFNOT, 1},
+    {LOP_JUMPIFEQ, 2},
+    {LOP_JUMPIFLE, 2},
+    {LOP_JUMPIFLT, 2},
+    {LOP_JUMPIFNOTEQ, 2},
+    {LOP_JUMPIFNOTLE, 2},
+    {LOP_JUMPIFNOTLT, 2},
+    {LOP_ADD, 1},
+    {LOP_SUB, 1},
+    {LOP_MUL, 1},
+    {LOP_DIV, 1},
+    {LOP_MOD, 1},
+    {LOP_POW, 1},
+    {LOP_ADDK, 1},
+    {LOP_SUBK, 1},
+    {LOP_MULK, 1},
+    {LOP_DIVK, 1},
+    {LOP_MODK, 1},
+    {LOP_POWK, 1},
+    {LOP_AND, 1},
+    {LOP_OR, 1},
+    {LOP_ANDK, 1},
+    {LOP_ORK, 1},
+    {LOP_CONCAT, 1},
+    {LOP_NOT, 1},
+    {LOP_MINUS, 1},
+    {LOP_LENGTH, 1},
+    {LOP_NEWTABLE, 2},
+    {LOP_DUPTABLE, 1},
+    {LOP_SETLIST, 2},
+    {LOP_FORNPREP, 1},
+    {LOP_FORNLOOP, 1},
+    {LOP_FORGLOOP, 2},
+    {LOP_FORGPREP_INEXT, 1},
+    {LOP_FASTCALL3, 2},
+    {LOP_FORGPREP_NEXT, 1},
+    {LOP_NATIVECALL, 1},
+    {LOP_GETVARARGS, 1},
+    {LOP_DUPCLOSURE, 1},
+    {LOP_PREPVARARGS, 1},
+    {LOP_LOADKX, 2},
+    {LOP_JUMPX, 1},
+    {LOP_FASTCALL, 1},
+    {LOP_COVERAGE, 1},
+    {LOP_CAPTURE, 1},
+    {LOP_SUBRK, 1},
+    {LOP_DIVRK, 1},
+    {LOP_FASTCALL1, 1},
+    {LOP_FASTCALL2, 2},
+    {LOP_FASTCALL2K, 2},
+    {LOP_FORGPREP, 1},
+    {LOP_JUMPXEQKNIL, 2},
+    {LOP_JUMPXEQKB, 2},
+    {LOP_JUMPXEQKN, 2},
+    {LOP_JUMPXEQKS, 2},
+    {LOP_IDIV, 1},
+    {LOP_IDIVK, 1},
+    {LOP_GETUDATAKS, 2},
+    {LOP_SETUDATAKS, 2},
+    {LOP_NAMECALLUDATA, 2},
+    {LOP_NEWCLASSMEMBER, 2},
+    {LOP_CALLFB, 2},
+    {LOP_CMPPROTO, 2},
+    {LOP_FASTPCALL, 1},
+    {LOP_NEWCLASS, 2},
+    {LOP_CONSTRUCT, 2},
+    {LOP_FINCONSTRUCT, 1},
+    {LOP_GETPRIVATEFIELD, 2},
+    {LOP_SETPRIVATEFIELD, 2},
+};
+
+constexpr std::size_t opcodeRows = sizeof(opcodeContract) / sizeof(opcodeContract[0]);
+static_assert(opcodeRows == LOP__COUNT, "Luau bytecode contract drift: missing or extra opcode rows");
+
+constexpr bool opcodeRowsMatchWireOrder(std::size_t i)
+{
+    return i == opcodeRows ||
+        (opcodeContract[i].opcode == int(i) && (opcodeContract[i].words == 1 || opcodeContract[i].words == 2) &&
+            opcodeRowsMatchWireOrder(i + 1));
+}
+static_assert(opcodeRowsMatchWireOrder(0), "Luau bytecode contract drift: opcode order or invalid width");
 
 #undef EXPECT_VALUE
 
 int main()
 {
+    // getOpLength defaults to 1 for unlisted opcodes. Pin the expected widths independently
+    // so that losing an AUX entry fails this check even when all opcode numbers stay the same.
+    for (const OpcodeContract& row : opcodeContract)
+    {
+        int actual = Luau::getOpLength(row.opcode);
+        if (actual != row.words)
+        {
+            std::fprintf(stderr, "Luau bytecode contract drift: opcode %d expected %d words, got %d\n",
+                int(row.opcode), row.words, actual);
+            return 1;
+        }
+    }
+
     std::printf("Luau bytecode contract OK: %d opcodes, bytecode %d..%d, type encoding %d..%d\n",
         LOP__COUNT, LBC_VERSION_MIN, LBC_VERSION_MAX, LBC_TYPE_VERSION_MIN, LBC_TYPE_VERSION_MAX);
 }
