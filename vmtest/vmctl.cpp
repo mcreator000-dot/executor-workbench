@@ -5,6 +5,11 @@
 #include "lua.h"
 #include "lualib.h"
 #include "luacode.h"
+#include <string>
+#include "Luau/Compiler.h"
+#include "Luau/ParseResult.h"
+#include "Luau/Parser.h"
+#include "Luau/Ast.h"
 
 static int run_bytes(const char* label, const char* data, size_t size)
 {
@@ -30,6 +35,41 @@ static int run_bytes(const char* label, const char* data, size_t size)
     return prc == 0 ? 0 : 1;
 }
 
+
+// Syntax gate: compile a SOURCE file and report parser diagnostics with line/column.
+// Compiling is not executing - nothing in the file runs here.
+static int check_source(const char* label, const std::string& src)
+{
+    // Luau::compile() swallows CompileError internally and still returns bytecode for a
+    // recovered AST, so "compiled OK" is NOT a syntax check. Parse explicitly and read the
+    // error list - that is the only honest gate.
+    Luau::Allocator allocator;
+    Luau::AstNameTable names(allocator);
+    Luau::ParseOptions popts;
+    Luau::ParseResult pr = Luau::Parser::parse(src.c_str(), src.size(), names, allocator, popts);
+    if (!pr.errors.empty()) {
+        int n = 0;
+        for (const Luau::ParseError& pe : pr.errors) {
+            const Luau::Location loc = pe.getLocation();
+            printf("[%s] SYNTAX ERROR %u:%u: %s\n", label, (unsigned)loc.begin.line,
+                   (unsigned)loc.begin.column, pe.getMessage().c_str());
+            if (++n >= 20) break;
+        }
+        fflush(stdout);
+        return 1;
+    }
+    Luau::CompileOptions opts;
+    try {
+        std::string bc = Luau::compile(src, opts);
+        printf("[%s] OK parses; %zu bytes of bytecode\n", label, bc.size());
+    } catch (std::exception& e) {
+        printf("[%s] OK parses; bytecode failed: %s\n", label, e.what());
+        return 1;
+    }
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -43,6 +83,19 @@ int main(int argc, char** argv)
         int r = run_bytes("control", bc, outsize);
         free(bc);
         return r;
+    }
+    if (argc >= 3 && strcmp(argv[1], "--check") == 0) {
+        int rc2 = 0;
+        for (int i = 2; i < argc; ++i) {
+            FILE* f = fopen(argv[i], "rb");
+            if (!f) { printf("[%s] cannot open\n", argv[i]); rc2 = 2; continue; }
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            std::string src;
+            if (n > 0) { src.resize((size_t)n); size_t got = fread(&src[0], 1, (size_t)n, f); src.resize(got); }
+            fclose(f);
+            rc2 |= check_source(argv[i], src);
+        }
+        return rc2;
     }
     int rc = 0;
     for (int i = 2; i < argc; ++i) {
