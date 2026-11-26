@@ -33,7 +33,48 @@ from the place afterward. Open the dock widget with **Workbench**. See Roblox's
   its marker is reused, so look at fresh Output. After stopping, remove the staged runner in
   Explorer when finished; the pane's **Clear** button only clears the pane.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:77854b64206ef62977151c4193158640d36e80b8d01aefb4c52d8f0514c077c7 -->
+
+## Auto mode
+
+**Auto** launches the client test and reports its result when the test ends. The server
+reporter starts a **30-second** deadline after it starts. A matching client result ends the
+test with that result; the deadline ends it with **timed out / verdict unconfirmed**. A
+result arriving after the deadline is not accepted. For longer snippets, adjust
+`AUTO_TIMEOUT_SECONDS` (1–300 seconds) and `AUTO_WATCHDOG_SECONDS` in the plugin.
+
+A separate **45-second** plugin watchdog reports that the call is still waiting. It keeps
+the call alive so that a later return is still shown, and blocks overlapping Workbench runs.
+If the reporter never starts or `EndTest` fails, this watchdog cannot end the playtest;
+use Studio's Stop button if needed. It does not promise a hard 45-second end.
+
+Auto reports a client `ERR` on the error channel. It rejects a result for a different
+run ID, removes previous Workbench client runners when staging, and reports a launch error
+without automatically retrying. Roblox documents an error when another test is running; the
+exact error text is Studio-dependent and unverified.
+
+The pane wraps long lines and has a vertical scrollbar. After installing the patch, verify:
+
+1. Run the WalkSpeed Auto snippet twice sequentially; check each run's fresh GUID and full
+   verdict, including a narrow widget and scrolling.
+2. In Auto, use `local p = game.Players.LocalPlayer; task.wait(60)`. Check that the
+   server returns a timeout near 30 seconds and the pane says verdict unconfirmed.
+3. Click Auto twice while the first call is pending. Check that only one test starts and
+   the pane says to wait. If a call remains pending past 45 seconds, check the watchdog
+   message, stop in Studio, and observe whether a late return is reported.
+4. Run an Auto snippet that throws after referencing `LocalPlayer`; check for an error
+   verdict. Manual F5 remains a separate, unverified Studio path.
+
+The mock scheduler test can be run from the repository root with
+`python tests/auto_hardening_test.py /path/to/luau`. It exercises the launch and reporter
+logic and four guard and declaration-order mutations; it does not simulate Studio's UI
+or engine scheduler.
+
 ## Why the verdict stays in Output
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 <!-- coderabbit-ai-generated:v1 -->
 

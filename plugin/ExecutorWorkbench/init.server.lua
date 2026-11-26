@@ -62,24 +62,42 @@ local importBtn = mkButton("Import", 96, 80)
 local clearBtn = mkButton("Clear", 184, 80)
 local autoBtn = mkButton("Auto", 272, 80)
 
+local outputScroll = Instance.new("ScrollingFrame")
+outputScroll.Size = UDim2.new(1, -16, 0.58, -56)
+outputScroll.Position = UDim2.new(0, 8, 0.42, 40)
+outputScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 21)
+outputScroll.BorderSizePixel = 0
+outputScroll.ScrollBarThickness = 8
+outputScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+outputScroll.CanvasSize = UDim2.fromOffset(0, 0)
+outputScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+outputScroll.Parent = root
+
 local out = Instance.new("TextBox")
-out.Size = UDim2.new(1, -16, 0.58, -56)
-out.Position = UDim2.new(0, 8, 0.42, 40)
-out.BackgroundColor3 = Color3.fromRGB(18, 18, 21)
+out.Size = UDim2.new(1, -8, 0, 0)
+out.AutomaticSize = Enum.AutomaticSize.Y
+out.BackgroundTransparency = 1
 out.TextColor3 = Color3.fromRGB(190, 215, 190)
 out.Font = Enum.Font.Code
 out.TextSize = 13
+out.TextWrapped = true
 out.MultiLine = true
 out.TextEditable = false
 out.ClearTextOnFocus = false
 out.TextXAlignment = Enum.TextXAlignment.Left
 out.TextYAlignment = Enum.TextYAlignment.Top
 out.Text = ""
-out.Parent = root
+out.Parent = outputScroll
+
+-- Follow new output; older entries remain accessible by scrolling.
+outputScroll:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+	outputScroll.CanvasPosition = Vector2.new(0, math.max(0, outputScroll.AbsoluteCanvasSize.Y - outputScroll.AbsoluteWindowSize.Y))
+end)
 
 -- ---------------------------------------------------------------- output channels
 local history = {}
 local counter = 0
+local activeAutoRun = nil
 
 local function stamp()
 	return os.date("%H:%M:%S")
@@ -223,8 +241,8 @@ end
 
 -- ---------------------------------------------------------------- client path
 -- LocalPlayer, CharacterAdded and the Humanoid only exist on the client during a playtest, so the
--- snippet is installed as a LocalScript and runs when Play starts. Previous WB_Client_* scripts are
--- removed first so repeated runs never stack up (that stacking is what breaks a session).
+-- snippet is installed as a LocalScript and runs when Play starts. Remove previous manual and
+-- automated runners so repeated runs do not execute stale snippets.
 local function clearClientScripts()
 	local folder = StarterPlayer:FindFirstChild("StarterPlayerScripts")
 	if not folder then
@@ -232,7 +250,8 @@ local function clearClientScripts()
 	end
 	local removed = 0
 	for _, child in ipairs(folder:GetChildren()) do
-		if child:IsA("LocalScript") and string.sub(child.Name, 1, 10) == "WB_Client_" then
+		if child:IsA("LocalScript") and
+			(string.sub(child.Name, 1, 10) == "WB_Client_" or string.sub(child.Name, 1, 8) == "WB_Auto_") then
 			child:Destroy()
 			removed += 1
 		end
@@ -409,21 +428,47 @@ end
 -- plugin-started test: the client FireServer's one string, a server Script reads GetTestArgs() and
 -- calls EndTest(result), and ExecutePlayModeAsync returns that result to the waiting plugin.
 -- Staged only for auto mode; F5 mode never creates these objects.
+-- The deadline starts when the server reporter runs, not when Studio begins launching.
+local AUTO_TIMEOUT_SECONDS = 30
+local AUTO_WATCHDOG_SECONDS = 45
+
 local SERVER_REPORTER = [==[
 if not game:GetService("RunService"):IsStudio() then
 	return
 end
 local service = game:GetService("StudioTestService")
--- GetTestArgs() is nil for a manually started test (F5), so the reporter must not bail out there:
--- in F5 mode there is no plugin to return a result to, and the verdict is mirrored into Server
--- Output instead. That removes the dependency on hunting through Client Output for the marker.
+-- Manual F5 has no Workbench test arguments; keep mirroring its reports to Server Output.
 local args = service:GetTestArgs()
 local testRunId = nil
 if type(args) == "table" and args.kind == "WB" and type(args.runId) == "string" then
 	testRunId = args.runId
 end
-local report = game:GetService("ReplicatedStorage"):WaitForChild("WB_TestResult")
+
 local done = false
+local function finish(result)
+	if done then
+		return
+	end
+	done = true
+	local ok, err = pcall(function()
+		service:EndTest(result)
+	end)
+	if not ok then
+		warn("Workbench EndTest failed: " .. tostring(err))
+	end
+end
+
+if testRunId then
+	local timeoutSeconds = args.timeoutSeconds
+	if type(timeoutSeconds) ~= "number" or timeoutSeconds < 1 or timeoutSeconds > 300 then
+		timeoutSeconds = 30
+	end
+	task.delay(timeoutSeconds, function()
+		finish({ runId = testRunId, status = "timeout" })
+	end)
+end
+
+local report = game:GetService("ReplicatedStorage"):WaitForChild("WB_TestResult")
 report.OnServerEvent:Connect(function(_player, message)
 	if type(message) ~= "string" then
 		return
@@ -432,16 +477,12 @@ report.OnServerEvent:Connect(function(_player, message)
 		print("[Workbench] client verdict: " .. message)
 		return
 	end
-	if done then
+
+	local marker = "WB_CLIENT_RESULT " .. testRunId
+	if message ~= marker .. " OK" and string.sub(message, 1, #marker + 5) ~= marker .. " ERR " then
 		return
 	end
-	done = true
-	local ok, err = pcall(function()
-		service:EndTest({ runId = testRunId, message = message })
-	end)
-	if not ok then
-		warn("Workbench EndTest failed: " .. tostring(err))
-	end
+	finish({ runId = testRunId, message = message })
 end)
 ]==]
 
@@ -473,6 +514,10 @@ local function stageHandshake()
 end
 
 local function runAutomated(source)
+	if activeAutoRun then
+		append("pending", "an Auto run is still active; wait for its result")
+		return false
+	end
 	if not RunService:IsEdit() then
 		append("error", "stop the playtest before launching an automated run")
 		return false
@@ -507,23 +552,40 @@ local function runAutomated(source)
 		return false
 	end
 
-	append("pending", "starting playtest for " .. runId .. " (the pane updates when the test ends)")
+	activeAutoRun = runId
+	append("pending", "starting playtest for " .. runId .. " (server deadline: " .. AUTO_TIMEOUT_SECONDS .. "s)")
+	task.delay(AUTO_WATCHDOG_SECONDS, function()
+		if activeAutoRun == runId then
+			append("pending", "auto run " .. runId .. " is still waiting; verdict unconfirmed. Stop the playtest in Studio if needed")
+		end
+	end)
 	task.spawn(function()
-		local ok, result = pcall(execute, service, { kind = "WB", runId = runId })
+		local ok, result = pcall(execute, service, { kind = "WB", runId = runId, timeoutSeconds = AUTO_TIMEOUT_SECONDS })
+		activeAutoRun = nil
 		if not ok then
 			append("error", "playtest call failed: " .. tostring(result))
 		elseif result == nil then
 			append("pending", "test ended without a result (verdict unconfirmed)")
-		elseif type(result) ~= "table" or result.runId ~= runId or type(result.message) ~= "string" then
+		elseif type(result) ~= "table" or result.runId ~= runId then
 			append("pending", "invalid or mismatched test result (verdict unconfirmed)")
+		elseif result.status == "timeout" then
+			append("pending", "auto run " .. runId .. " timed out waiting for client (verdict unconfirmed)")
+		elseif result.message == marker .. " OK" then
+			append("ok", "client reported " .. result.message)
+		elseif type(result.message) == "string" and string.sub(result.message, 1, #marker + 5) == marker .. " ERR " then
+			append("error", "client reported " .. result.message)
 		else
-			append("ok", "client reported " .. tostring(result.message))
+			append("pending", "invalid or mismatched test result (verdict unconfirmed)")
 		end
 	end)
 	return true
 end
 
 local function run(source)
+	if activeAutoRun then
+		append("pending", "an Auto run is still active; wait for its result")
+		return false
+	end
 	counter += 1
 	append("run", "run #" .. counter)
 	local hint = needsClient(source)
