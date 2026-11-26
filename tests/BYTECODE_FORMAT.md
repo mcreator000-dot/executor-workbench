@@ -123,11 +123,18 @@ The formatter's default only executes `LUAU_ASSERT`; it can emit nothing in a bu
 assertions. See [`BytecodeUtils.h:11–53`](https://github.com/luau-lang/luau/blob/97b2f4bf9cd935bed666f3e643a3b749b4d22f38/Common/include/Luau/BytecodeUtils.h#L11-L53) and
 [`BytecodeBuilder.cpp:2978–2981`](https://github.com/luau-lang/luau/blob/97b2f4bf9cd935bed666f3e643a3b749b4d22f38/Bytecode/src/BytecodeBuilder.cpp#L2978-L2981), [3186–3195](https://github.com/luau-lang/luau/blob/97b2f4bf9cd935bed666f3e643a3b749b4d22f38/Bytecode/src/BytecodeBuilder.cpp#L3186-L3195).
 
-The existing `static_assert(LOP__COUNT == 95)` catches enum growth if the test is built.
-The patch adds `static_assert(opcodeRows == LOP__COUNT)` against an **inferred-size** table,
-checks that every row matches its wire index and has a width of 1 or 2, and compares the
-explicit widths against `getOpLength` for all 95 entries. Bumping the count alone cannot
-bypass the table check, and dropping an AUX case fails the test even with an unchanged enum.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:558ec9ef26c8a26448264e1cdc0fe68ba20d9dc018626fe9efa889c4860174d1 -->
+
+The test asserts that `LOP__COUNT == 95`, that an inferred-size table has exactly
+`LOP__COUNT` rows, and that each row matches its wire index. A separate compile-time
+check compares each width to a pinned list of opcodes with AUX words. Changing
+`{LOP_MOVE, 1}` to `{LOP_MOVE, 2}` fails compilation. The executable also checks each
+explicit width against Luau's non-`constexpr` `getOpLength`. Dropping an AUX case in
+the vendored helper fails the executable even if the enum and test table are unchanged.
+
+<!-- /coderabbit-ai-generated:v1 -->
 When wiring this into a decoder, apply the same coverage assertion to the decoder's actual
 metadata table. If it has a separate formatter switch, require exhaustive enum coverage
 (for GCC, `-Werror=switch-enum`) or generate the dispatch from that table. At runtime,

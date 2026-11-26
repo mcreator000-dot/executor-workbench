@@ -139,12 +139,41 @@ constexpr bool opcodeRowsMatchWireOrder(std::size_t i)
 }
 static_assert(opcodeRowsMatchWireOrder(0), "Luau bytecode contract drift: opcode order or invalid width");
 
+// Independent snapshot of the two-word cases. The vendored getOpLength is not
+// constexpr, so keep the runtime comparison below to verify this against Luau.
+constexpr LuauOpcode auxWordOpcodes[] = {
+    LOP_GETGLOBAL, LOP_SETGLOBAL, LOP_GETIMPORT,
+    LOP_GETTABLEKS, LOP_SETTABLEKS, LOP_NAMECALL,
+    LOP_JUMPIFEQ, LOP_JUMPIFLE, LOP_JUMPIFLT,
+    LOP_JUMPIFNOTEQ, LOP_JUMPIFNOTLE, LOP_JUMPIFNOTLT,
+    LOP_NEWTABLE, LOP_SETLIST, LOP_FORGLOOP,
+    LOP_LOADKX, LOP_FASTCALL2, LOP_FASTCALL2K,
+    LOP_FASTCALL3, LOP_JUMPXEQKNIL, LOP_JUMPXEQKB,
+    LOP_JUMPXEQKN, LOP_JUMPXEQKS, LOP_GETUDATAKS,
+    LOP_SETUDATAKS, LOP_NAMECALLUDATA, LOP_NEWCLASSMEMBER,
+    LOP_CALLFB, LOP_CMPPROTO, LOP_NEWCLASS,
+    LOP_CONSTRUCT, LOP_GETPRIVATEFIELD, LOP_SETPRIVATEFIELD,
+};
+constexpr std::size_t auxWordOpcodeCount = sizeof(auxWordOpcodes) / sizeof(auxWordOpcodes[0]);
+
+constexpr bool hasAuxWord(LuauOpcode opcode, std::size_t i)
+{
+    return i < auxWordOpcodeCount && (auxWordOpcodes[i] == opcode || hasAuxWord(opcode, i + 1));
+}
+
+constexpr bool opcodeWidthsMatch(std::size_t i)
+{
+    return i == opcodeRows ||
+        (opcodeContract[i].words == (hasAuxWord(opcodeContract[i].opcode, 0) ? 2 : 1) && opcodeWidthsMatch(i + 1));
+}
+static_assert(opcodeWidthsMatch(0), "Luau bytecode contract drift: opcode width does not match pinned AUX list");
+
 #undef EXPECT_VALUE
 
 int main()
 {
     // getOpLength defaults to 1 for unlisted opcodes. Pin the expected widths independently
-    // so that losing an AUX entry fails this check even when all opcode numbers stay the same.
+    // so that losing an AUX entry in the vendored helper still fails the executable.
     for (const OpcodeContract& row : opcodeContract)
     {
         int actual = Luau::getOpLength(row.opcode);
