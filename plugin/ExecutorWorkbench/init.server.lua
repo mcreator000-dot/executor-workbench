@@ -60,6 +60,7 @@ end
 local runBtn = mkButton("Run", 8, 80)
 local importBtn = mkButton("Import", 96, 80)
 local clearBtn = mkButton("Clear", 184, 80)
+local autoBtn = mkButton("Auto", 272, 80)
 
 local out = Instance.new("TextBox")
 out.Size = UDim2.new(1, -16, 0.58, -56)
@@ -248,13 +249,23 @@ local ok, err = xpcall(function()
 ]=]
 
 local function clientSuffix(marker)
+	-- The print/warn pair is the F5 path (read it in Studio Output). The FireServer part only does
+	-- anything when the auto-mode handshake staged ReplicatedStorage.WB_TestResult; in F5 mode it is
+	-- a no-op, so one script body serves both modes.
 	return "\nend, function(e) return debug.traceback(tostring(e), 2) end)\n" ..
 		string.format([=[
 local marker = %q
+local verdict
 if ok then
-	print(marker .. " OK")
+	verdict = marker .. " OK"
+	print(verdict)
 else
-	warn(marker .. " ERR " .. tostring(err))
+	verdict = marker .. " ERR " .. tostring(err)
+	warn(verdict)
+end
+local report = game:GetService("ReplicatedStorage"):FindFirstChild("WB_TestResult")
+if report and report:IsA("RemoteEvent") then
+	pcall(function() report:FireServer(verdict) end)
 end
 ]=], marker)
 end
@@ -393,6 +404,114 @@ local function needsClient(source)
 	return scan(false)
 end
 
+-- ---------------------------------------------------------------- automated mode
+-- A LocalScript cannot hand a verdict to an edit-mode plugin. The documented indirect route is a
+-- plugin-started test: the client FireServer's one string, a server Script reads GetTestArgs() and
+-- calls EndTest(result), and ExecutePlayModeAsync returns that result to the waiting plugin.
+-- Staged only for auto mode; F5 mode never creates these objects.
+local SERVER_REPORTER = [==[
+if not game:GetService("RunService"):IsStudio() then
+	return
+end
+local service = game:GetService("StudioTestService")
+local args = service:GetTestArgs()
+if type(args) ~= "table" or args.kind ~= "WB" or type(args.runId) ~= "string" then
+	return
+end
+local report = game:GetService("ReplicatedStorage"):WaitForChild("WB_TestResult")
+local done = false
+report.OnServerEvent:Connect(function(_player, message)
+	if done or type(message) ~= "string" then
+		return
+	end
+	done = true
+	local ok, err = pcall(function()
+		service:EndTest({ runId = args.runId, message = message })
+	end)
+	if not ok then
+		warn("Workbench EndTest failed: " .. tostring(err))
+	end
+end)
+]==]
+
+local function stageHandshake()
+	local okAll, errAll = pcall(function()
+		local rs = game:GetService("ReplicatedStorage")
+		local ss = game:GetService("ServerScriptService")
+		local oldEvent = rs:FindFirstChild("WB_TestResult")
+		if oldEvent then
+			oldEvent:Destroy()
+		end
+		local remote = Instance.new("RemoteEvent")
+		remote.Name = "WB_TestResult"
+		remote.Parent = rs
+		local oldReporter = ss:FindFirstChild("WB_TestReporter")
+		if oldReporter then
+			oldReporter:Destroy()
+		end
+		local reporter = Instance.new("Script")
+		reporter.Name = "WB_TestReporter"
+		reporter.Source = SERVER_REPORTER
+		reporter.Parent = ss
+	end)
+	if not okAll then
+		append("error", "handshake staging failed: " .. tostring(errAll))
+		return false
+	end
+	return true
+end
+
+local function runAutomated(source)
+	if not RunService:IsEdit() then
+		append("error", "stop the playtest before launching an automated run")
+		return false
+	end
+	if not needsClient(source) then
+		append("warn", "auto mode is client-only for now; use Run for server snippets")
+		return false
+	end
+	if not stageHandshake() then
+		return false
+	end
+
+	local runId = HttpService:GenerateGUID(false)
+	local marker = "WB_CLIENT_RESULT " .. runId
+	local folder = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if not folder then
+		append("error", "no StarterPlayerScripts in this place")
+		return false
+	end
+	clearClientScripts()
+	local clientScript = Instance.new("LocalScript")
+	clientScript.Name = "WB_Auto_" .. counter
+	clientScript.Source = CLIENT_PREFIX .. source .. clientSuffix(marker)
+	clientScript.Parent = folder
+
+	local available, service, execute = pcall(function()
+		local s = game:GetService("StudioTestService")
+		return s, s.ExecutePlayModeAsync
+	end)
+	if not available or type(execute) ~= "function" then
+		append("pending", "StudioTestService unavailable on this Studio build; use Run then F5 and read Output")
+		return false
+	end
+
+	append("pending", "starting playtest for " .. runId .. " (the pane updates when the test ends)")
+	task.spawn(function()
+		local ok, result = pcall(execute, service, { kind = "WB", runId = runId })
+		if not ok then
+			append("error", "playtest call failed: " .. tostring(result))
+		elseif result == nil then
+			append("pending", "test ended without a result (verdict unconfirmed)")
+		elseif type(result) ~= "table" or result.runId ~= runId or type(result.message) ~= "string" then
+			append("pending", "invalid or mismatched test result (verdict unconfirmed)")
+		else
+			append("ok", "client reported " .. tostring(result.message))
+		end
+	end)
+	return true
+end
+
 local function run(source)
 	counter += 1
 	append("run", "run #" .. counter)
@@ -445,6 +564,21 @@ importBtn.MouseButton1Click:Connect(function()
 	end
 	code.Text = text
 	append("info", string.format("imported %s (%d bytes) - syntax is checked on Run", file.Name, #text))
+end)
+
+
+autoBtn.MouseButton1Click:Connect(function()
+	local text = code.Text
+	if text == "" then
+		append("warn", "nothing to run")
+		return
+	end
+	counter += 1
+	append("run", "auto #" .. counter)
+	local ok, err = pcall(runAutomated, text)
+	if not ok then
+		append("error", "auto run failed: " .. tostring(err))
+	end
 end)
 
 clearBtn.MouseButton1Click:Connect(function()
