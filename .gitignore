@@ -1,0 +1,10 @@
+﻿# build output
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.zip
+# local notes
+*.local.md
