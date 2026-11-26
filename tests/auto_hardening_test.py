@@ -39,11 +39,14 @@ with tempfile.TemporaryDirectory(prefix="wb-auto-test-") as directory:
 
     # Prove the tests execute the guards, rather than merely parsing them.
     busy = '''	if activeAutoRun then
+		if probeName then
+			traceAutoProbe("Auto blocked: active runId=" .. activeAutoRun)
+		end
 		append("pending", "an Auto run is still active; wait for its result")
 		return false
 	end
 '''
-    assert plugin.count(busy) == 2
+    assert plugin.count(busy) == 1
     result = run(plugin.replace(busy, "", 1), reporter)
     assert result.returncode != 0 and "busy guard failed" in result.stderr, result.stderr
     print("Mutation rejected: Auto busy guard")
@@ -65,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="wb-auto-test-") as directory:
 
     # Luau resolves locals lexically, so moving this function earlier can compile
     # but bind needsClient (and stageHandshake) as globals.
-    start = plugin.index("local function runAutomated(source)")
+    start = plugin.index("local function runAutomated(source, probeName)")
     end = plugin.index("\nlocal function run(source)", start)
     run_automated = plugin[start:end]
     moved = plugin[:start] + plugin[end:]
@@ -74,3 +77,10 @@ with tempfile.TemporaryDirectory(prefix="wb-auto-test-") as directory:
     result = run(moved, reporter)
     assert result.returncode != 0 and "first start/cleanup failed" in result.stderr, result.stderr
     print("Mutation rejected: declaration order")
+
+
+    result_trace = '\t\t\ttraceAutoProbe(string.format("pcall returned ok=%s result=%s runId=%s resultRunId=%s",'
+    assert plugin.count(result_trace) == 1
+    result = run(plugin.replace(result_trace, result_trace.replace("pcall returned", "missing probe trace"), 1), reporter)
+    assert result.returncode != 0 and "probe failed to record the timeout return" in result.stderr, result.stderr
+    print("Mutation rejected: plugin return trace")

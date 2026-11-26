@@ -431,6 +431,12 @@ end
 -- The deadline starts when the server reporter runs, not when Studio begins launching.
 local AUTO_TIMEOUT_SECONDS = 30
 local AUTO_WATCHDOG_SECONDS = 45
+local AUTO_PROBE_ATTRIBUTE = "WB_AutoProbe"
+local AUTO_PROBE_TRACE_ATTRIBUTE = "WB_AutoProbeTrace"
+local AUTO_PROBES = {
+	A = { timeout = 3, watchdog = 8, source = 'local p = game:GetService("Players").LocalPlayer; while true do task.wait(1) end' },
+	B = { timeout = 60, watchdog = 3, source = 'local p = game:GetService("Players").LocalPlayer; task.wait(10)' },
+}
 
 local SERVER_REPORTER = [==[
 if not game:GetService("RunService"):IsStudio() then
@@ -444,6 +450,7 @@ if type(args) == "table" and args.kind == "WB" and type(args.runId) == "string" 
 	testRunId = args.runId
 end
 
+local probe = testRunId and (args.probe == "A" or args.probe == "B")
 local done = false
 local function finish(result)
 	if done then
@@ -451,8 +458,14 @@ local function finish(result)
 	end
 	done = true
 	local ok, err = pcall(function()
+		if probe and result.status == "timeout" then
+			print("[WB] server timeout fired runId=" .. testRunId .. "; calling EndTest")
+		end
 		service:EndTest(result)
 	end)
+	if probe then
+		print("[WB] server EndTest returned ok=" .. tostring(ok) .. " runId=" .. testRunId)
+	end
 	if not ok then
 		warn("Workbench EndTest failed: " .. tostring(err))
 	end
@@ -466,6 +479,9 @@ if testRunId then
 	task.delay(timeoutSeconds, function()
 		finish({ runId = testRunId, status = "timeout" })
 	end)
+	if probe then
+		print("[WB] server timeout armed runId=" .. testRunId .. " seconds=" .. timeoutSeconds)
+	end
 end
 
 local report = game:GetService("ReplicatedStorage"):WaitForChild("WB_TestResult")
@@ -481,6 +497,9 @@ report.OnServerEvent:Connect(function(_player, message)
 	local marker = "WB_CLIENT_RESULT " .. testRunId
 	if message ~= marker .. " OK" and string.sub(message, 1, #marker + 5) ~= marker .. " ERR " then
 		return
+	end
+	if probe and not done then
+		print("[WB] server verdict received runId=" .. testRunId .. "; calling EndTest")
 	end
 	finish({ runId = testRunId, message = message })
 end)
@@ -513,8 +532,25 @@ local function stageHandshake()
 	return true
 end
 
-local function runAutomated(source)
+local function traceAutoProbe(message)
+	local line = "[WB] " .. message
+	print(line)
+	-- MCP can read the edit DataModel even if its console omits User Plugin lines.
+	local ok, err = pcall(function()
+		local previous = ServerStorage:GetAttribute(AUTO_PROBE_TRACE_ATTRIBUTE)
+		local trace = (type(previous) == "string" and (previous .. "\n") or "") .. line
+		ServerStorage:SetAttribute(AUTO_PROBE_TRACE_ATTRIBUTE, string.sub(trace, -1800))
+	end)
+	if not ok then
+		warn("[WB] edit trace write failed: " .. tostring(err))
+	end
+end
+
+local function runAutomated(source, probeName)
 	if activeAutoRun then
+		if probeName then
+			traceAutoProbe("Auto blocked: active runId=" .. activeAutoRun)
+		end
 		append("pending", "an Auto run is still active; wait for its result")
 		return false
 	end
@@ -532,6 +568,14 @@ local function runAutomated(source)
 
 	local runId = HttpService:GenerateGUID(false)
 	local marker = "WB_CLIENT_RESULT " .. runId
+	local probe = AUTO_PROBES[probeName]
+	local timeoutSeconds = AUTO_TIMEOUT_SECONDS
+	local watchdogSeconds = AUTO_WATCHDOG_SECONDS
+	if probe then
+		timeoutSeconds = probe.timeout
+		watchdogSeconds = probe.watchdog
+		source = string.format('print(%q)\n', "[WB] client started runId=" .. runId) .. source
+	end
 	local folder = StarterPlayer:FindFirstChild("StarterPlayerScripts")
 	if not folder then
 		append("error", "no StarterPlayerScripts in this place")
@@ -553,14 +597,27 @@ local function runAutomated(source)
 	end
 
 	activeAutoRun = runId
-	append("pending", "starting playtest for " .. runId .. " (server deadline: " .. AUTO_TIMEOUT_SECONDS .. "s)")
-	task.delay(AUTO_WATCHDOG_SECONDS, function()
+	append("pending", "starting playtest for " .. runId .. " (server deadline: " .. timeoutSeconds .. "s)")
+	task.delay(watchdogSeconds, function()
+		if probe then
+			traceAutoProbe("watchdog ran runId=" .. runId .. " active=" .. tostring(activeAutoRun == runId))
+		end
 		if activeAutoRun == runId then
 			append("pending", "auto run " .. runId .. " is still waiting; verdict unconfirmed. Stop the playtest in Studio if needed")
 		end
 	end)
 	task.spawn(function()
-		local ok, result = pcall(execute, service, { kind = "WB", runId = runId, timeoutSeconds = AUTO_TIMEOUT_SECONDS })
+		if probe then
+			traceAutoProbe(string.format("calling ExecutePlayModeAsync runId=%s probe=%s timeout=%s watchdog=%s",
+				runId, probeName, timeoutSeconds, watchdogSeconds))
+		end
+		local ok, result = pcall(execute, service, { kind = "WB", runId = runId, timeoutSeconds = timeoutSeconds, probe = probeName })
+		if probe then
+			local resultRunId = type(result) == "table" and result.runId or nil
+			local value = type(result) == "table" and (result.status or result.message or "<table>") or result
+			traceAutoProbe(string.format("pcall returned ok=%s result=%s runId=%s resultRunId=%s",
+				tostring(ok), (tostring(value):gsub("[\r\n]+", " ")), runId, tostring(resultRunId)))
+		end
 		activeAutoRun = nil
 		if not ok then
 			append("error", "playtest call failed: " .. tostring(result))
@@ -641,14 +698,16 @@ end)
 
 
 autoBtn.MouseButton1Click:Connect(function()
-	local text = code.Text
+	local probeName = ServerStorage:GetAttribute(AUTO_PROBE_ATTRIBUTE)
+	local probe = AUTO_PROBES[probeName]
+	local text = probe and probe.source or code.Text
 	if text == "" then
 		append("warn", "nothing to run")
 		return
 	end
 	counter += 1
 	append("run", "auto #" .. counter)
-	local ok, err = pcall(runAutomated, text)
+	local ok, err = pcall(runAutomated, text, probe and probeName or nil)
 	if not ok then
 		append("error", "auto run failed: " .. tostring(err))
 	end
