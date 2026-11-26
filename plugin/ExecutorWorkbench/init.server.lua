@@ -414,19 +414,30 @@ if not game:GetService("RunService"):IsStudio() then
 	return
 end
 local service = game:GetService("StudioTestService")
+-- GetTestArgs() is nil for a manually started test (F5), so the reporter must not bail out there:
+-- in F5 mode there is no plugin to return a result to, and the verdict is mirrored into Server
+-- Output instead. That removes the dependency on hunting through Client Output for the marker.
 local args = service:GetTestArgs()
-if type(args) ~= "table" or args.kind ~= "WB" or type(args.runId) ~= "string" then
-	return
+local testRunId = nil
+if type(args) == "table" and args.kind == "WB" and type(args.runId) == "string" then
+	testRunId = args.runId
 end
 local report = game:GetService("ReplicatedStorage"):WaitForChild("WB_TestResult")
 local done = false
 report.OnServerEvent:Connect(function(_player, message)
-	if done or type(message) ~= "string" then
+	if type(message) ~= "string" then
+		return
+	end
+	if not testRunId then
+		print("[Workbench] client verdict: " .. message)
+		return
+	end
+	if done then
 		return
 	end
 	done = true
 	local ok, err = pcall(function()
-		service:EndTest({ runId = args.runId, message = message })
+		service:EndTest({ runId = testRunId, message = message })
 	end)
 	if not ok then
 		warn("Workbench EndTest failed: " .. tostring(err))
